@@ -31,7 +31,7 @@ You'll need:
 From a Claude Code session:
 
 ```text
-/plugin marketplace add vvoland/claude-plugin-matrix
+/plugin marketplace add vvoland/claude-marketplace
 /plugin install matrix@vvoland
 ```
 
