@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "vvoland",
+  "owner": {
+    "name": "vvoland"
+  },
+  "description": "vvoland's marketplace for Claude Code plugins",
+  "plugins": [
+    {
+      "name": "matrix",
+      "description": "Matrix channel for Claude Code — messaging bridge with built-in access control.",
+      "category": "channel",
+      "source": "./matrix"
+    }
+  ]
+}

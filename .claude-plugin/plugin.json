@@ -1,0 +1,11 @@
+{
+  "name": "claude-code-marketplace",
+  "description": "Claude Code marketplace repository.",
+  "version": "1.0.0",
+  "keywords": [
+    "claude-code",
+    "marketplace",
+    "plugin",
+    "matrix"
+  ]
+}
