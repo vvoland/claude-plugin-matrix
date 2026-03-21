@@ -6,10 +6,8 @@ Connect a Matrix bot to your Claude Code session via an MCP server.
 
 This plugin is installed via a Claude Code marketplace catalog.
 
-- If you use the public marketplace repo, add it and install:
-
 ```text
-/plugin marketplace add vvoland/<marketplace-repo>
+/plugin marketplace add vvoland/claude-marketplace
 /plugin install matrix@vvoland
 ```
 

@@ -11,6 +11,6 @@ It intentionally contains only the marketplace catalog (no plugin code). The Mat
 From a Claude Code session:
 
 ```text
-/plugin marketplace add vvoland/<marketplace-repo>
+/plugin marketplace add vvoland/claude-marketplace
 /plugin install matrix@vvoland
 ```
