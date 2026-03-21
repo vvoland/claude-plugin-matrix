@@ -152,7 +152,7 @@ async function downloadRawMedia(mxcUrl: string): Promise<{ data: Buffer; filenam
   const m = mxcUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/)
   if (!m) throw new Error(`invalid mxc URL: ${mxcUrl}`)
   const [, server, mediaId] = m
-  const url = `${HOMESERVER}/_matrix/media/v3/download/${encodeURIComponent(server)}/${encodeURIComponent(mediaId)}`
+  const url = `${HOMESERVER}/_matrix/client/v1/media/download/${encodeURIComponent(server)}/${encodeURIComponent(mediaId)}`
   const res = await fetch(url, {
     headers: { 'Authorization': `Bearer ${TOKEN}` },
   })
