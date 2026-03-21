@@ -2,18 +2,18 @@
 
 Connect a Matrix bot to your Claude Code session via an MCP server.
 
-This repository is the source for the **Matrix plugin** and includes a single-plugin Claude Code marketplace entry used for installation.
-
 ## Install
 
-From a Claude Code session:
+This plugin is installed via a Claude Code marketplace catalog.
+
+- If you use the public marketplace repo, add it and install:
 
 ```text
-/plugin marketplace add vvoland/claude-plugin-matrix
+/plugin marketplace add vvoland/<marketplace-repo>
 /plugin install matrix@vvoland
 ```
 
-Run Claude Code with the Matrix channel enabled:
+Then run Claude Code with the Matrix channel enabled:
 
 ```bash
 claude --dangerously-load-development-channels plugin:matrix@vvoland

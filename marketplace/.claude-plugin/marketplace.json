@@ -4,13 +4,16 @@
   "owner": {
     "name": "vvoland"
   },
-  "description": "Claude Code Matrix plugin",
+  "description": "vvoland plugin marketplace (catalog only)",
   "plugins": [
     {
       "name": "matrix",
       "description": "Matrix channel for Claude Code — messaging bridge with built-in access control.",
       "category": "channel",
-      "source": "./matrix"
+      "source": {
+        "source": "github",
+        "repo": "vvoland/claude-plugin-matrix"
+      }
     }
   ]
 }

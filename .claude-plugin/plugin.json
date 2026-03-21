@@ -1,10 +1,9 @@
 {
-  "name": "claude-code-marketplace",
-  "description": "Claude Code marketplace repository.",
+  "name": "claude-plugin-matrix",
+  "description": "Claude Code Matrix plugin.",
   "version": "1.0.0",
   "keywords": [
     "claude-code",
-    "marketplace",
     "plugin",
     "matrix"
   ]
