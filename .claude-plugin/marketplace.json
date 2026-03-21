@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "vvoland",
+  "name": "vvoland-matrix",
   "owner": {
     "name": "vvoland"
   },
-  "description": "vvoland's marketplace for Claude Code plugins",
+  "description": "Claude Code Matrix plugin",
   "plugins": [
     {
       "name": "matrix",
