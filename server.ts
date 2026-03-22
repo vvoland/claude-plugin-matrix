@@ -1,10 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Matrix channel for Claude Code.
- *
- * Self-contained MCP server with full access control and end-to-end encryption.
- * Uses matrix-bot-sdk with Rust crypto for transparent E2EE in encrypted rooms.
- * State lives in ~/.claude/channels/matrix/ — managed by the /matrix:access skill.
+ * Matrix MCP server — thin client that forwards tool calls to the Matrix daemon
+ * over a Unix socket. The daemon holds the MatrixClient and E2EE state.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -13,563 +10,192 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import * as net from 'net'
+import { spawn } from 'child_process'
+import { readFileSync, existsSync, openSync } from 'fs'
+import { dirname } from 'path'
 import {
-  MatrixClient,
-  AutojoinRoomsMixin,
-  SimpleFsStorageProvider,
-  RustSdkCryptoStorageProvider,
-  LogService,
-  LogLevel,
-} from 'matrix-bot-sdk'
-import { randomBytes, createCipheriv, createDecipheriv, createHash } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync } from 'fs'
-import { homedir } from 'os'
-import { join, extname, sep, basename } from 'path'
+  STATE_DIR, SOCKET_PATH, PID_FILE, LOG_FILE,
+  type DaemonRequest, type DaemonResponse, type DaemonPush,
+} from './protocol.js'
 
-// matrix-bot-sdk logs to console by default — MCP uses stdout for protocol,
-// so redirect everything to stderr to avoid corruption.
-LogService.setLevel(LogLevel.WARN)
-LogService.setLogger({
-  info: (mod: string, msg: string) => process.stderr.write(`[matrix:info] ${mod}: ${msg}\n`),
-  warn: (mod: string, msg: string) => process.stderr.write(`[matrix:warn] ${mod}: ${msg}\n`),
-  error: (mod: string, msg: string) => process.stderr.write(`[matrix:error] ${mod}: ${msg}\n`),
-  debug: () => {},
-  trace: () => {},
-})
+// ---------- Daemon connection ----------
 
-const STATE_DIR = join(homedir(), '.claude', 'channels', 'matrix')
-const ACCESS_FILE = join(STATE_DIR, 'access.json')
-const APPROVED_DIR = join(STATE_DIR, 'approved')
-const ENV_FILE = join(STATE_DIR, '.env')
-const CRYPTO_DIR = join(STATE_DIR, 'crypto')
-const SYNC_FILE = join(STATE_DIR, 'bot-sync.json')
-const INBOX_DIR = join(STATE_DIR, 'inbox')
+let socket: net.Socket | null = null
+let connected = false
+let socketBuffer = ''
+const pendingRequests = new Map<string, {
+  resolve: (value: unknown) => void
+  reject: (reason: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}>()
 
-mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-mkdirSync(CRYPTO_DIR, { recursive: true, mode: 0o700 })
-
-// Load ~/.claude/channels/matrix/.env into process.env. Real env wins.
-try {
-  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
-  }
-} catch {}
-
-const HOMESERVER = (process.env.MATRIX_HOMESERVER ?? '').replace(/\/+$/, '')
-const TOKEN = process.env.MATRIX_ACCESS_TOKEN
-const STATIC = process.env.MATRIX_ACCESS_MODE === 'static'
-
-if (!HOMESERVER || !TOKEN) {
-  process.stderr.write(
-    `matrix channel: MATRIX_HOMESERVER and MATRIX_ACCESS_TOKEN required\n` +
-    `  set in ${ENV_FILE}\n` +
-    `  format:\n` +
-    `    MATRIX_HOMESERVER=https://matrix.example.com\n` +
-    `    MATRIX_ACCESS_TOKEN=syt_...\n`,
-  )
-  process.exit(1)
-}
-
-// ---------- Matrix client with E2EE ----------
-
-const storage = new SimpleFsStorageProvider(SYNC_FILE)
-const cryptoProvider = new RustSdkCryptoStorageProvider(CRYPTO_DIR)
-const client = new MatrixClient(HOMESERVER, TOKEN, storage, cryptoProvider)
-
-// Auto-join rooms on invite
-AutojoinRoomsMixin.setupOnClient(client)
-
-let botUserId = ''
-
-// ---------- Encrypted media helpers ----------
-// In E2EE rooms, media files are encrypted client-side before upload using
-// AES-256-CTR per the Matrix spec. The decryption key is included in the
-// event content (which itself is encrypted at the room level by the SDK).
-
-type EncryptedFileInfo = {
-  url: string
-  key: { kty: string; key_ops: string[]; alg: string; k: string; ext: boolean }
-  iv: string
-  hashes: { sha256: string }
-  v: string
-  mimetype?: string
-}
-
-function encryptAttachment(data: Buffer): { ciphertext: Buffer; info: Omit<EncryptedFileInfo, 'url'> } {
-  const key = randomBytes(32)
-  const iv = Buffer.alloc(16)
-  randomBytes(8).copy(iv) // First 8 bytes random, last 8 zero (counter)
-
-  const cipher = createCipheriv('aes-256-ctr', key, iv)
-  const ciphertext = Buffer.concat([cipher.update(data), cipher.final()])
-  const hash = createHash('sha256').update(ciphertext).digest()
-
-  return {
-    ciphertext,
-    info: {
-      v: 'v2',
-      key: {
-        kty: 'oct',
-        key_ops: ['encrypt', 'decrypt'],
-        alg: 'A256CTR',
-        k: key.toString('base64url'),
-        ext: true,
-      },
-      iv: iv.toString('base64'),
-      hashes: { sha256: hash.toString('base64url') },
-    },
-  }
-}
-
-function decryptAttachment(ciphertext: Buffer, info: EncryptedFileInfo): Buffer {
-  const key = Buffer.from(info.key.k, 'base64url')
-  const iv = Buffer.from(info.iv, 'base64')
-  const decipher = createDecipheriv('aes-256-ctr', key, iv)
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()])
-}
-
-// ---------- Media upload/download ----------
-// Use raw fetch for media endpoints since matrix-bot-sdk's helpers may not
-// handle encrypted file uploads with the exact control we need.
-
-async function uploadRawMedia(data: Buffer, contentType: string, filename: string): Promise<string> {
-  const url = `${HOMESERVER}/_matrix/media/v3/upload?filename=${encodeURIComponent(filename)}`
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': contentType },
-    body: data,
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`media upload failed: ${res.status} ${text}`)
-  }
-  const result = await res.json() as { content_uri: string }
-  return result.content_uri
-}
-
-async function downloadRawMedia(mxcUrl: string): Promise<{ data: Buffer; filename: string }> {
-  const m = mxcUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/)
-  if (!m) throw new Error(`invalid mxc URL: ${mxcUrl}`)
-  const [, server, mediaId] = m
-  const url = `${HOMESERVER}/_matrix/client/v1/media/download/${encodeURIComponent(server)}/${encodeURIComponent(mediaId)}`
-  const res = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${TOKEN}` },
-  })
-  if (!res.ok) throw new Error(`media download failed: ${res.status}`)
-  const disposition = res.headers.get('content-disposition') ?? ''
-  const fnMatch = disposition.match(/filename="?([^";\s]+)"?/)
-  const filename = basename(fnMatch ? fnMatch[1] : mediaId)
-  const buf = Buffer.from(await res.arrayBuffer())
-  return { data: buf, filename }
-}
-
-// Cache encryption state per room — encryption is never disabled once enabled,
-// so a positive result is permanent. Negative results are re-checked.
-const encryptedRoomCache = new Map<string, boolean>()
-
-async function isRoomEncrypted(roomId: string): Promise<boolean> {
-  const cached = encryptedRoomCache.get(roomId)
-  if (cached === true) return true
+function processSocketLine(line: string): void {
+  let msg: DaemonResponse | DaemonPush
   try {
-    await client.getRoomStateEvent(roomId, 'm.room.encryption', '')
-    encryptedRoomCache.set(roomId, true)
+    msg = JSON.parse(line)
+  } catch {
+    process.stderr.write(`[matrix:mcp] invalid JSON from daemon: ${line.slice(0, 200)}\n`)
+    return
+  }
+
+  // Check if this is a response (has id) or a push (has method)
+  if ('id' in msg && (msg as DaemonResponse).id) {
+    const resp = msg as DaemonResponse
+    const pending = pendingRequests.get(resp.id)
+    if (pending) {
+      pendingRequests.delete(resp.id)
+      clearTimeout(pending.timer)
+      if (resp.error) {
+        pending.reject(new Error(resp.error))
+      } else {
+        pending.resolve(resp.result)
+      }
+    }
+  } else if ('method' in msg && (msg as DaemonPush).method === 'inbound') {
+    const push = msg as DaemonPush
+    // Forward as MCP channel notification
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: push.params,
+    })
+  }
+}
+
+function setupSocketReader(sock: net.Socket): void {
+  sock.on('data', (data: Buffer) => {
+    socketBuffer += data.toString()
+    let newlineIdx: number
+    while ((newlineIdx = socketBuffer.indexOf('\n')) !== -1) {
+      const line = socketBuffer.slice(0, newlineIdx).trim()
+      socketBuffer = socketBuffer.slice(newlineIdx + 1)
+      if (line) processSocketLine(line)
+    }
+  })
+
+  sock.on('close', () => {
+    connected = false
+    socket = null
+    socketBuffer = ''
+    // Reject all pending requests
+    for (const [id, pending] of pendingRequests) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('daemon connection lost'))
+      pendingRequests.delete(id)
+    }
+  })
+
+  sock.on('error', (err) => {
+    process.stderr.write(`[matrix:mcp] socket error: ${err.message}\n`)
+  })
+}
+
+function connectToSocket(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(SOCKET_PATH, () => {
+      socket = sock
+      connected = true
+      socketBuffer = ''
+      setupSocketReader(sock)
+      resolve()
+    })
+    sock.on('error', reject)
+  })
+}
+
+function isDaemonAlive(): boolean {
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf8').trim(), 10)
+    if (!pid) return false
+    process.kill(pid, 0)
     return true
   } catch {
-    encryptedRoomCache.set(roomId, false)
     return false
   }
 }
 
-async function uploadFile(
-  filePath: string,
-  encrypted: boolean,
-): Promise<{ content: Record<string, unknown>; msgtype: string }> {
-  const ext = extname(filePath).toLowerCase()
-  const mime = mimeFromExt(ext)
-  const name = basename(filePath)
-  const fileData = readFileSync(filePath)
-  const size = fileData.length
-
-  let msgtype = 'm.file'
-  if (IMAGE_EXTS.has(ext)) msgtype = 'm.image'
-  else if (VIDEO_EXTS.has(ext)) msgtype = 'm.video'
-  else if (AUDIO_EXTS.has(ext)) msgtype = 'm.audio'
-
-  if (encrypted) {
-    // Encrypt the file before uploading
-    const { ciphertext, info } = encryptAttachment(fileData)
-    const mxcUri = await uploadRawMedia(ciphertext, 'application/octet-stream', name)
-    return {
-      msgtype,
-      content: {
-        msgtype,
-        body: name,
-        file: { ...info, url: mxcUri, mimetype: mime },
-        info: { mimetype: mime, size },
-      },
-    }
-  } else {
-    const mxcUri = await uploadRawMedia(fileData, mime, name)
-    return {
-      msgtype,
-      content: {
-        msgtype,
-        body: name,
-        url: mxcUri,
-        info: { mimetype: mime, size },
-      },
-    }
-  }
+function spawnDaemon(): void {
+  const daemonScript = new URL('./matrix-daemon.ts', import.meta.url).pathname
+  const logFd = openSync(LOG_FILE, 'a')
+  const child = spawn('bun', [daemonScript], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    cwd: dirname(daemonScript),
+  })
+  child.unref()
+  process.stderr.write(`[matrix:mcp] spawned daemon (pid ${child.pid})\n`)
 }
 
-async function downloadInboundMedia(event: MatrixEvent): Promise<string | undefined> {
+async function ensureDaemon(): Promise<void> {
+  // Already connected?
+  if (connected && socket && !socket.destroyed) return
+
+  // Try connecting to existing daemon
   try {
-    // In E2EE rooms, media is in content.file; in plaintext rooms, content.url
-    const fileInfo = event.content?.file as EncryptedFileInfo | undefined
-    const directUrl = event.content?.url as string | undefined
-    const body = (event.content?.body as string) || 'attachment'
+    await connectToSocket()
+    process.stderr.write(`[matrix:mcp] connected to existing daemon\n`)
+    return
+  } catch {
+    // Can't connect — need to spawn
+  }
 
-    if (fileInfo?.url) {
-      // Encrypted media — download then decrypt
-      const { data } = await downloadRawMedia(fileInfo.url)
-      const decrypted = decryptAttachment(data, fileInfo)
-      const ext = extname(body) || '.bin'
-      const path = join(INBOX_DIR, `${Date.now()}-${basename(body, ext)}${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, decrypted)
-      return path
-    } else if (directUrl?.startsWith('mxc://')) {
-      // Plaintext media — download directly
-      const { data, filename } = await downloadRawMedia(directUrl)
-      const path = join(INBOX_DIR, `${Date.now()}-${filename}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, data)
-      return path
+  // If daemon is alive but socket isn't ready yet, wait a bit
+  if (isDaemonAlive()) {
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500))
+      try {
+        await connectToSocket()
+        process.stderr.write(`[matrix:mcp] connected to daemon after wait\n`)
+        return
+      } catch {}
     }
-  } catch (err) {
-    process.stderr.write(`matrix channel: media download failed: ${err}\n`)
+    throw new Error('daemon is running but socket is not available')
   }
-  return undefined
-}
 
-// ---------- Access control ----------
+  // Spawn new daemon
+  spawnDaemon()
 
-type PendingEntry = {
-  senderId: string
-  roomId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type RoomPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  rooms: Record<string, RoomPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  ackReaction?: string
-  replyToMode?: 'off' | 'first' | 'all'
-  textChunkLimit?: number
-  chunkMode?: 'length' | 'newline'
-}
-
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    rooms: {},
-    pending: {},
-  }
-}
-
-// Matrix practical message limit. Spec allows up to 65535 bytes, but many
-// clients truncate around 40000. Play it safe.
-const MAX_CHUNK_LIMIT = 40000
-const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
-
-function assertSendable(f: string): void {
-  let real, stateReal: string
-  try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return }
-  const inbox = join(stateReal, 'inbox')
-  if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
-    throw new Error(`refusing to send channel state: ${f}`)
-  }
-}
-
-function readAccessFile(): Access {
-  try {
-    const raw = readFileSync(ACCESS_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      rooms: parsed.rooms ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
+  // Wait up to 10s for socket
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 250))
     try {
-      renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`)
-    } catch {}
-    process.stderr.write(`matrix channel: access.json is corrupt, moved aside. Starting fresh.\n`)
-    return defaultAccess()
-  }
-}
-
-const BOOT_ACCESS: Access | null = STATIC
-  ? (() => {
-      const a = readAccessFile()
-      if (a.dmPolicy === 'pairing') {
-        process.stderr.write(
-          'matrix channel: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
-        )
-        a.dmPolicy = 'allowlist'
-      }
-      a.pending = {}
-      return a
-    })()
-  : null
-
-function loadAccess(): Access {
-  return BOOT_ACCESS ?? readAccessFile()
-}
-
-function assertAllowedRoom(room_id: string): void {
-  const access = loadAccess()
-  if (room_id in access.rooms) return
-  // DM rooms are only valid if the associated user is still allowlisted
-  const dmUser = dmRooms.get(room_id)
-  if (dmUser && access.allowFrom.includes(dmUser)) return
-  throw new Error(`room ${room_id} is not allowlisted — add via /matrix:access`)
-}
-
-function saveAccess(a: Access): void {
-  if (STATIC) return
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
-}
-
-function pruneExpired(a: Access): boolean {
-  const now = Date.now()
-  let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) {
-      delete a.pending[code]
-      changed = true
-    }
-  }
-  return changed
-}
-
-// Track DM rooms → user ID so the outbound gate can verify the user is
-// still allowlisted. Persisted to disk to survive restarts.
-const DM_ROOMS_FILE = join(STATE_DIR, 'dm-rooms.json')
-
-const dmRooms: Map<string, string> = (() => {
-  try {
-    const raw = readFileSync(DM_ROOMS_FILE, 'utf8')
-    const parsed = JSON.parse(raw)
-    // Support both old Set format (string[]) and new Map format ({roomId: userId})
-    if (Array.isArray(parsed)) return new Map<string, string>()
-    return new Map<string, string>(Object.entries(parsed))
-  } catch { return new Map<string, string>() }
-})()
-
-function saveDmRooms(): void {
-  const tmp = DM_ROOMS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(Object.fromEntries(dmRooms)) + '\n', { mode: 0o600 })
-  renameSync(tmp, DM_ROOMS_FILE)
-}
-
-type GateResult =
-  | { action: 'deliver'; access: Access }
-  | { action: 'drop' }
-  | { action: 'pair'; code: string; isResend: boolean }
-
-function gate(senderId: string, roomId: string): GateResult {
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-  if (senderId === botUserId) return { action: 'drop' }
-
-  // Check if this is a configured room (group)
-  if (roomId in access.rooms) {
-    const policy = access.rooms[roomId]
-    const roomAllowFrom = policy.allowFrom ?? []
-    if (roomAllowFrom.length > 0 && !roomAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
-    // requireMention is checked by the caller since it needs message content
-    return { action: 'deliver', access }
-  }
-
-  // DM behavior
-  if (access.allowFrom.includes(senderId)) {
-    if (dmRooms.get(roomId) !== senderId) {
-      dmRooms.set(roomId, senderId)
-      saveDmRooms()
-    }
-    return { action: 'deliver', access }
-  }
-  if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
-  // pairing mode
-  for (const [code, p] of Object.entries(access.pending)) {
-    if (p.senderId === senderId) {
-      if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-      p.replies = (p.replies ?? 1) + 1
-      saveAccess(access)
-      return { action: 'pair', code, isResend: true }
-    }
-  }
-  if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
-
-  const code = randomBytes(3).toString('hex')
-  const now = Date.now()
-  access.pending[code] = {
-    senderId,
-    roomId,
-    createdAt: now,
-    expiresAt: now + 60 * 60 * 1000,
-    replies: 1,
-  }
-  saveAccess(access)
-  return { action: 'pair', code, isResend: false }
-}
-
-function isMentioned(body: string, formattedBody: string | undefined, extraPatterns?: string[]): boolean {
-  if (body.includes(botUserId)) return true
-  const displayName = botUserId.replace(/^@/, '').split(':')[0]
-  if (displayName && body.toLowerCase().includes(displayName.toLowerCase())) return true
-  if (formattedBody && formattedBody.includes(botUserId)) return true
-
-  for (const pat of extraPatterns ?? []) {
-    try {
-      if (new RegExp(pat, 'i').test(body)) return true
+      await connectToSocket()
+      process.stderr.write(`[matrix:mcp] connected to new daemon\n`)
+      return
     } catch {}
   }
-  return false
+
+  throw new Error('daemon did not start within 10 seconds — check ' + LOG_FILE)
 }
 
-function isReplyToBot(event: MatrixEvent): boolean {
-  const relatesTo = event.content?.['m.relates_to'] as Record<string, unknown> | undefined
-  if (relatesTo?.['m.in_reply_to']) {
-    const formatted = (event.content?.formatted_body as string) ?? ''
-    if (formatted.includes(botUserId)) return true
-  }
-  return false
-}
+async function sendRequest(method: string, params: Record<string, unknown>): Promise<string> {
+  await ensureDaemon()
 
-// The /matrix:access skill drops a file at approved/<senderId> when it pairs
-// someone. Poll for it, send confirmation, clean up.
-function checkApprovals(): void {
-  let files: string[]
-  try {
-    files = readdirSync(APPROVED_DIR)
-  } catch { return }
-  if (files.length === 0) return
+  const id = crypto.randomUUID()
+  const request: DaemonRequest = { id, method, params }
 
-  for (const safeFilename of files) {
-    const file = join(APPROVED_DIR, safeFilename)
-    // Filename is URI-encoded for filesystem safety
-    const senderId = decodeURIComponent(safeFilename)
-    let roomId: string
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id)
+      reject(new Error(`request ${method} timed out after 30s`))
+    }, 30000)
+
+    pendingRequests.set(id, {
+      resolve: (value) => resolve(String(value ?? '')),
+      reject,
+      timer,
+    })
+
     try {
-      roomId = readFileSync(file, 'utf8').trim()
-    } catch {
-      rmSync(file, { force: true })
-      continue
+      socket!.write(JSON.stringify(request) + '\n')
+    } catch (err) {
+      pendingRequests.delete(id)
+      clearTimeout(timer)
+      connected = false
+      socket = null
+      reject(new Error(`failed to write to daemon: ${err instanceof Error ? err.message : err}`))
     }
-    if (!roomId) {
-      const access = loadAccess()
-      for (const p of Object.values(access.pending)) {
-        if (p.senderId === senderId) {
-          roomId = p.roomId
-          break
-        }
-      }
-    }
-    if (roomId) {
-      client.sendMessage(roomId, {
-        msgtype: 'm.text',
-        body: "Paired! Say hi to Claude.",
-      }).then(
-        () => rmSync(file, { force: true }),
-        err => {
-          process.stderr.write(`matrix channel: failed to send approval confirm: ${err}\n`)
-          rmSync(file, { force: true })
-        },
-      )
-    } else {
-      rmSync(file, { force: true })
-    }
-  }
-}
-
-if (!STATIC) setInterval(checkApprovals, 5000)
-
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
-
-const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'])
-const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mkv', '.avi', '.mov'])
-const AUDIO_EXTS = new Set(['.mp3', '.ogg', '.wav', '.flac', '.m4a', '.opus'])
-
-function mimeFromExt(ext: string): string {
-  const map: Record<string, string> = {
-    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-    '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-    '.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
-    '.avi': 'video/x-msvideo', '.mov': 'video/quicktime',
-    '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav',
-    '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.opus': 'audio/opus',
-    '.pdf': 'application/pdf', '.txt': 'text/plain', '.json': 'application/json',
-  }
-  return map[ext] ?? 'application/octet-stream'
-}
-
-type MatrixEvent = {
-  type: string
-  event_id: string
-  sender: string
-  room_id: string
-  origin_server_ts: number
-  content: Record<string, unknown>
+  })
 }
 
 // ---------- MCP Server ----------
@@ -696,174 +322,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
-    switch (req.params.name) {
-      case 'reply': {
-        const room_id = args.room_id as string
-        const text = args.text as string
-        const reply_to = args.reply_to as string | undefined
-        const files = (args.files as string[] | undefined) ?? []
-
-        assertAllowedRoom(room_id)
-
-        for (const f of files) {
-          assertSendable(f)
-          const st = statSync(f)
-          if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 100MB)`)
-          }
-        }
-
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
-        const sentIds: string[] = []
-
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const content: Record<string, unknown> = {
-              msgtype: 'm.text',
-              body: chunks[i],
-            }
-            if (shouldReplyTo) {
-              content['m.relates_to'] = {
-                'm.in_reply_to': { event_id: reply_to },
-              }
-            }
-            // sendMessage auto-encrypts in E2EE rooms
-            const eventId = await client.sendMessage(room_id, content)
-            sentIds.push(eventId)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
-        }
-
-        // Files — upload (with file-level encryption for E2EE rooms) then send
-        const roomEncrypted = files.length > 0 ? await isRoomEncrypted(room_id) : false
-        for (const f of files) {
-          const { content } = await uploadFile(f, roomEncrypted)
-          if (reply_to && replyMode !== 'off') {
-            content['m.relates_to'] = {
-              'm.in_reply_to': { event_id: reply_to },
-            }
-          }
-          // sendMessage auto-encrypts the event in E2EE rooms
-          const eventId = await client.sendMessage(room_id, content)
-          sentIds.push(eventId)
-        }
-
-        const result =
-          sentIds.length === 1
-            ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result }] }
-      }
-      case 'react': {
-        assertAllowedRoom(args.room_id as string)
-        // sendEvent auto-encrypts in E2EE rooms
-        const eventId = await client.sendEvent(args.room_id as string, 'm.reaction', {
-          'm.relates_to': {
-            rel_type: 'm.annotation',
-            event_id: args.event_id as string,
-            key: args.emoji as string,
-          },
-        })
-        return { content: [{ type: 'text', text: `reacted (id: ${eventId})` }] }
-      }
-      case 'edit_message': {
-        assertAllowedRoom(args.room_id as string)
-        const newText = args.text as string
-        // sendEvent auto-encrypts in E2EE rooms
-        const eventId = await client.sendEvent(args.room_id as string, 'm.room.message', {
-          msgtype: 'm.text',
-          body: `* ${newText}`,
-          'm.new_content': {
-            msgtype: 'm.text',
-            body: newText,
-          },
-          'm.relates_to': {
-            rel_type: 'm.replace',
-            event_id: args.event_id as string,
-          },
-        })
-        return { content: [{ type: 'text', text: `edited (id: ${eventId})` }] }
-      }
-      case 'fetch_messages': {
-        assertAllowedRoom(args.room_id as string)
-        const limit = Math.max(1, Math.min(Number(args.limit) || 20, 100))
-        const roomId = args.room_id as string
-        const path = `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=${limit}`
-        const result = await client.doRequest('GET', path) as { chunk: MatrixEvent[] }
-        const rawEvents = (result.chunk ?? []).reverse()
-
-        // The /messages endpoint returns raw events — encrypted events come
-        // back as m.room.encrypted blobs that the SDK sync layer would
-        // normally decrypt. We can't retroactively decrypt them here without
-        // the inbound Megolm session (which may have been received via sync
-        // but isn't accessible through the REST API). Strip encrypted blobs
-        // and surface what we can.
-        const messages = rawEvents.map(ev => {
-          if (ev.type === 'm.room.encrypted') {
-            return {
-              type: ev.type,
-              event_id: ev.event_id,
-              sender: ev.sender,
-              origin_server_ts: ev.origin_server_ts,
-              note: 'encrypted event — content not available via history fetch',
-            }
-          }
-          return {
-            type: ev.type,
-            event_id: ev.event_id,
-            sender: ev.sender,
-            origin_server_ts: ev.origin_server_ts,
-            content: ev.content,
-          }
-        })
-        return {
-          content: [{ type: 'text', text: JSON.stringify(messages, null, 2) }],
-        }
-      }
-      case 'download_attachment': {
-        const mxcUrl = args.mxc_url as string
-        const fileInfo = args.file_info as EncryptedFileInfo | undefined
-
-        const { data, filename } = await downloadRawMedia(mxcUrl)
-        let finalData = data
-
-        // Decrypt if file_info with encryption keys is provided
-        if (fileInfo?.key && fileInfo?.iv) {
-          finalData = decryptAttachment(data, fileInfo)
-        }
-
-        const outPath = join(INBOX_DIR, `${Date.now()}-${filename}`)
-        mkdirSync(INBOX_DIR, { recursive: true })
-        writeFileSync(outPath, finalData)
-        return {
-          content: [{ type: 'text', text: `downloaded to ${outPath}` }],
-        }
-      }
-      case 'typing': {
-        assertAllowedRoom(args.room_id as string)
-        const isTyping = args.typing as boolean
-        const timeout = (args.timeout as number | undefined) ?? 30000
-        await client.setTyping(args.room_id as string, isTyping, isTyping ? timeout : undefined)
-        return { content: [{ type: 'text', text: isTyping ? 'typing indicator started' : 'typing indicator stopped' }] }
-      }
-      default:
-        return {
-          content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
-          isError: true,
-        }
-    }
+    const result = await sendRequest(req.params.name, args)
+    return { content: [{ type: 'text', text: result }] }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return {
@@ -873,113 +333,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
+// ---------- Start ----------
+
+// On exit: close socket, do NOT kill daemon
+process.on('exit', () => {
+  if (socket) {
+    try { socket.destroy() } catch {}
+  }
+})
+process.on('SIGINT', () => process.exit(0))
+process.on('SIGTERM', () => process.exit(0))
+
 await mcp.connect(new StdioServerTransport())
 
-// ---------- Start client ----------
-
-try {
-  botUserId = await client.getUserId()
-  process.stderr.write(`matrix channel: logged in as ${botUserId}\n`)
-} catch (err) {
-  process.stderr.write(`matrix channel: login failed: ${err}\n`)
-  process.exit(1)
-}
-
-// Register event handlers before starting sync
-
-// room.message fires for both encrypted and plaintext rooms — the SDK
-// decrypts automatically when the crypto provider is configured.
-client.on('room.message', async (roomId: string, event: MatrixEvent) => {
-  if (!event?.sender || event.sender === botUserId) return
-  if (event.type !== 'm.room.message') return
-  // Skip edits
-  if ((event.content?.['m.relates_to'] as Record<string, unknown> | undefined)?.rel_type === 'm.replace') return
-
-  await handleInbound(event, roomId)
+// Try to connect to daemon immediately (non-blocking — first tool call will retry if needed)
+ensureDaemon().catch(err => {
+  process.stderr.write(`[matrix:mcp] initial daemon connection deferred: ${err.message}\n`)
 })
-
-// Log decryption failures
-client.on('room.failed_decryption', (roomId: string, event: unknown, err: Error) => {
-  process.stderr.write(`matrix channel: decryption failed in ${roomId}: ${err.message}\n`)
-})
-
-// Start sync loop — the SDK handles sync internally
-await client.start()
-process.stderr.write(`matrix channel: listening for messages (E2EE enabled)\n`)
-
-// ---------- Inbound handler ----------
-
-async function handleInbound(event: MatrixEvent, roomId: string): Promise<void> {
-  const senderId = event.sender
-  const body = (event.content?.body as string) ?? ''
-  const formattedBody = event.content?.formatted_body as string | undefined
-  const msgtype = event.content?.msgtype as string
-
-  // Check if this is a configured room requiring mention
-  const access = loadAccess()
-  if (roomId in access.rooms) {
-    const policy = access.rooms[roomId]
-    if (policy.requireMention ?? true) {
-      if (!isMentioned(body, formattedBody, access.mentionPatterns) && !isReplyToBot(event)) {
-        return
-      }
-    }
-  }
-
-  const result = gate(senderId, roomId)
-
-  if (result.action === 'drop') return
-
-  if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await client.sendMessage(roomId, {
-      msgtype: 'm.text',
-      body: `${lead} — run in Claude Code:\n\n/matrix:access pair ${result.code}`,
-    })
-    return
-  }
-
-  // Typing indicator
-  void client.setTyping(roomId, true, 10000).catch(() => {})
-
-  // Ack reaction
-  if (result.access.ackReaction && event.event_id) {
-    void client.sendEvent(roomId, 'm.reaction', {
-      'm.relates_to': {
-        rel_type: 'm.annotation',
-        event_id: event.event_id,
-        key: result.access.ackReaction,
-      },
-    }).catch(() => {})
-  }
-
-  // Download media if present (handles both encrypted and plaintext media)
-  let imagePath: string | undefined
-  if (msgtype === 'm.image' || msgtype === 'm.file' || msgtype === 'm.video' || msgtype === 'm.audio') {
-    imagePath = await downloadInboundMedia(event)
-  }
-
-  const text = msgtype === 'm.image' ? (body || '(image)')
-    : msgtype === 'm.file' ? (body || '(file)')
-    : msgtype === 'm.video' ? (body || '(video)')
-    : msgtype === 'm.audio' ? (body || '(audio)')
-    : body
-
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        room_id: roomId,
-        event_id: event.event_id,
-        user: senderId,
-        user_id: senderId,
-        ts: new Date(event.origin_server_ts).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-      },
-    },
-  })
-
-  // Stop typing
-  void client.setTyping(roomId, false).catch(() => {})
-}
