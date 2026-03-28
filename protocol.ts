@@ -42,6 +42,7 @@ export type CronTask = {
   prompt: string
   enabled: boolean
   createdAt: string
+  lastRunAt?: string
 }
 
 export const CRON_FILE = join(STATE_DIR, 'cron.json')

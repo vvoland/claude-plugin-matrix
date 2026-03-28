@@ -1061,23 +1061,44 @@ function cronMatches(schedule: string, date: Date): boolean {
   )
 }
 
-// Track last fire time per task to avoid double-firing within the same minute
-const lastFired = new Map<string, number>()
+/**
+ * Find the next minute in (after, before] that matches the cron schedule.
+ * Returns null if no occurrence exists in that window.
+ * Caps the search at 48 hours to avoid runaway iteration.
+ */
+function nextCronOccurrence(schedule: string, after: Date, before: Date): Date | null {
+  const candidate = new Date(after)
+  candidate.setSeconds(0, 0)
+  candidate.setMinutes(candidate.getMinutes() + 1)
+
+  // Cap search window at 48 hours
+  const maxSearch = new Date(after.getTime() + 48 * 60 * 60_000)
+  const limit = before < maxSearch ? before : maxSearch
+
+  while (candidate <= limit) {
+    if (cronMatches(schedule, candidate)) return candidate
+    candidate.setMinutes(candidate.getMinutes() + 1)
+  }
+  return null
+}
 
 function checkCronTasks(): void {
   if (connectedClients.size === 0) return // nobody listening
 
   const now = new Date()
-  const minuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`
-
   const tasks = loadCronTasks()
+  let changed = false
+
   for (const task of tasks) {
     if (!task.enabled) continue
-    const taskMinuteKey = `${task.id}:${minuteKey}`
-    if (lastFired.has(taskMinuteKey)) continue
 
-    if (cronMatches(task.schedule, now)) {
-      lastFired.set(taskMinuteKey, Date.now())
+    const anchor = task.lastRunAt ?? task.createdAt
+    const after = new Date(anchor)
+    const next = nextCronOccurrence(task.schedule, after, now)
+
+    if (next) {
+      task.lastRunAt = now.toISOString()
+      changed = true
       log('info', `cron firing: ${task.name} (${task.id})`)
 
       broadcast({
@@ -1096,11 +1117,7 @@ function checkCronTasks(): void {
     }
   }
 
-  // Cleanup old lastFired entries (older than 2 minutes)
-  const cutoff = Date.now() - 120_000
-  for (const [key, ts] of lastFired) {
-    if (ts < cutoff) lastFired.delete(key)
-  }
+  if (changed) saveCronTasks(tasks)
 }
 
 // ---------- Main ----------
