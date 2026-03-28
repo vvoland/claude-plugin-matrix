@@ -23,8 +23,8 @@ import {
   LogLevel,
 } from 'matrix-bot-sdk'
 import {
-  STATE_DIR, SOCKET_PATH, PID_FILE, LOG_FILE,
-  type DaemonRequest, type DaemonResponse, type DaemonPush,
+  STATE_DIR, SOCKET_PATH, PID_FILE, LOG_FILE, CRON_FILE,
+  type DaemonRequest, type DaemonResponse, type DaemonPush, type CronTask,
 } from './protocol.js'
 
 // ---------- Logging ----------
@@ -780,6 +780,78 @@ async function handleToolRequest(method: string, params: Record<string, unknown>
       return `downloaded to ${outPath}`
     }
 
+    case 'cron_create': {
+      const name = params.name as string
+      const schedule = params.schedule as string
+      const prompt = params.prompt as string
+      if (!name || !schedule || !prompt) throw new Error('name, schedule, and prompt are required')
+
+      // Validate cron expression (must be 5 fields)
+      if (schedule.trim().split(/\s+/).length !== 5) {
+        throw new Error('schedule must be a 5-field cron expression: minute hour dom month dow')
+      }
+
+      const tasks = loadCronTasks()
+
+      // Check for duplicate name
+      const existing = tasks.find(t => t.name === name)
+      if (existing) {
+        // Update existing task
+        existing.schedule = schedule
+        existing.prompt = prompt
+        existing.enabled = true
+        saveCronTasks(tasks)
+        return `updated task "${name}" (id: ${existing.id})`
+      }
+
+      const task: CronTask = {
+        id: randomBytes(4).toString('hex'),
+        name,
+        schedule,
+        prompt,
+        enabled: true,
+        createdAt: new Date().toISOString(),
+      }
+      tasks.push(task)
+      saveCronTasks(tasks)
+      return `created task "${name}" (id: ${task.id}, schedule: ${schedule})`
+    }
+
+    case 'cron_delete': {
+      const id = params.id as string | undefined
+      const name = params.name as string | undefined
+      if (!id && !name) throw new Error('id or name is required')
+
+      const tasks = loadCronTasks()
+      const idx = tasks.findIndex(t => t.id === id || t.name === name)
+      if (idx === -1) throw new Error(`task not found: ${id || name}`)
+
+      const removed = tasks.splice(idx, 1)[0]
+      saveCronTasks(tasks)
+      return `deleted task "${removed.name}" (id: ${removed.id})`
+    }
+
+    case 'cron_list': {
+      const tasks = loadCronTasks()
+      if (tasks.length === 0) return 'no scheduled tasks'
+      return JSON.stringify(tasks, null, 2)
+    }
+
+    case 'cron_toggle': {
+      const id = params.id as string | undefined
+      const name = params.name as string | undefined
+      const enabled = params.enabled as boolean
+      if (!id && !name) throw new Error('id or name is required')
+
+      const tasks = loadCronTasks()
+      const task = tasks.find(t => t.id === id || t.name === name)
+      if (!task) throw new Error(`task not found: ${id || name}`)
+
+      task.enabled = enabled
+      saveCronTasks(tasks)
+      return `task "${task.name}" is now ${enabled ? 'enabled' : 'disabled'}`
+    }
+
     default:
       throw new Error(`unknown method: ${method}`)
   }
@@ -927,6 +999,110 @@ function setupMatrixHandlers(c: MatrixClient): void {
   })
 }
 
+// ---------- Cron scheduler ----------
+
+function loadCronTasks(): CronTask[] {
+  try {
+    const raw = readFileSync(CRON_FILE, 'utf8')
+    return JSON.parse(raw) as CronTask[]
+  } catch {
+    return []
+  }
+}
+
+function saveCronTasks(tasks: CronTask[]): void {
+  const tmp = CRON_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(tasks, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, CRON_FILE)
+}
+
+/**
+ * Parse a cron expression field against a value.
+ * Supports: *, exact numbers, comma-separated lists, ranges (1-5), steps (star/N).
+ */
+function cronFieldMatches(field: string, value: number): boolean {
+  if (field === '*') return true
+  for (const part of field.split(',')) {
+    // step: */N or range/N
+    if (part.includes('/')) {
+      const [range, stepStr] = part.split('/')
+      const step = parseInt(stepStr, 10)
+      if (isNaN(step) || step <= 0) continue
+      if (range === '*') {
+        if (value % step === 0) return true
+      } else if (range.includes('-')) {
+        const [lo, hi] = range.split('-').map(Number)
+        if (value >= lo && value <= hi && (value - lo) % step === 0) return true
+      }
+      continue
+    }
+    // range: N-M
+    if (part.includes('-')) {
+      const [lo, hi] = part.split('-').map(Number)
+      if (value >= lo && value <= hi) return true
+      continue
+    }
+    // exact
+    if (parseInt(part, 10) === value) return true
+  }
+  return false
+}
+
+function cronMatches(schedule: string, date: Date): boolean {
+  const parts = schedule.trim().split(/\s+/)
+  if (parts.length !== 5) return false
+  const [minute, hour, dom, month, dow] = parts
+  return (
+    cronFieldMatches(minute, date.getMinutes()) &&
+    cronFieldMatches(hour, date.getHours()) &&
+    cronFieldMatches(dom, date.getDate()) &&
+    cronFieldMatches(month, date.getMonth() + 1) &&
+    cronFieldMatches(dow, date.getDay())
+  )
+}
+
+// Track last fire time per task to avoid double-firing within the same minute
+const lastFired = new Map<string, number>()
+
+function checkCronTasks(): void {
+  if (connectedClients.size === 0) return // nobody listening
+
+  const now = new Date()
+  const minuteKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`
+
+  const tasks = loadCronTasks()
+  for (const task of tasks) {
+    if (!task.enabled) continue
+    const taskMinuteKey = `${task.id}:${minuteKey}`
+    if (lastFired.has(taskMinuteKey)) continue
+
+    if (cronMatches(task.schedule, now)) {
+      lastFired.set(taskMinuteKey, Date.now())
+      log('info', `cron firing: ${task.name} (${task.id})`)
+
+      broadcast({
+        method: 'inbound',
+        params: {
+          content: task.prompt,
+          meta: {
+            source: 'cron',
+            task_id: task.id,
+            task_name: task.name,
+            schedule: task.schedule,
+            ts: now.toISOString(),
+          },
+        },
+      })
+    }
+  }
+
+  // Cleanup old lastFired entries (older than 2 minutes)
+  const cutoff = Date.now() - 120_000
+  for (const [key, ts] of lastFired) {
+    if (ts < cutoff) lastFired.delete(key)
+  }
+}
+
 // ---------- Main ----------
 
 async function main(): Promise<void> {
@@ -1006,6 +1182,10 @@ async function main(): Promise<void> {
 
   // Start approval checker
   if (!STATIC) setInterval(checkApprovals, 5000)
+
+  // Start cron scheduler — check every 15 seconds
+  setInterval(checkCronTasks, 15_000)
+  log('info', `cron scheduler started (${loadCronTasks().filter(t => t.enabled).length} active tasks)`)
 }
 
 main().catch(err => {

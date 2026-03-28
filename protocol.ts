@@ -25,7 +25,7 @@ export type DaemonResponse = {
   error?: string
 }
 
-// Push from daemon to all connected MCPs (incoming Matrix messages)
+// Push from daemon to all connected MCPs (incoming Matrix messages or cron triggers)
 export type DaemonPush = {
   method: 'inbound'
   params: {
@@ -33,3 +33,15 @@ export type DaemonPush = {
     meta: Record<string, string | undefined>
   }
 }
+
+// Cron task definition
+export type CronTask = {
+  id: string
+  name: string
+  schedule: string // cron expression (minute hour dom month dow)
+  prompt: string
+  enabled: boolean
+  createdAt: string
+}
+
+export const CRON_FILE = join(STATE_DIR, 'cron.json')
