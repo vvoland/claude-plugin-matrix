@@ -897,6 +897,31 @@ function setupMatrixHandlers(c: MatrixClient): void {
     await handleInbound(event, roomId)
   })
 
+  // Handle reactions (👍 = approval/confirmation)
+  c.on('room.event', async (roomId: string, event: MatrixEvent) => {
+    if (!event?.sender || event.sender === botUserId) return
+    if (event.type !== 'm.reaction') return
+
+    const relatesTo = event.content?.['m.relates_to'] as Record<string, unknown> | undefined
+    if (!relatesTo || relatesTo.rel_type !== 'm.annotation') return
+
+    const emoji = relatesTo.key as string
+    const targetEventId = relatesTo.event_id as string
+
+    // Forward reaction as inbound notification
+    const text = `[reaction: ${emoji} on ${targetEventId}]`
+    const meta: Record<string, string | undefined> = {
+      room_id: roomId,
+      event_id: event.event_id,
+      user: event.sender,
+      user_id: event.sender,
+      ts: new Date(event.origin_server_ts).toISOString(),
+      reaction_emoji: emoji,
+      reaction_target: targetEventId,
+    }
+    broadcast({ method: 'inbound', params: { content: text, meta } })
+  })
+
   c.on('room.failed_decryption', (_roomId: string, _event: unknown, err: Error) => {
     log('warn', `decryption failed: ${err.message}`)
   })
