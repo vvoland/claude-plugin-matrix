@@ -231,6 +231,14 @@ const mcp = new Server(
   },
 )
 
+// Debug: log errors and unhandled notifications
+mcp.onerror = (error) => {
+  process.stderr.write(`[matrix:mcp] protocol error: ${error}\n`)
+}
+mcp.fallbackNotificationHandler = async (notification: unknown) => {
+  process.stderr.write(`[matrix:mcp] unhandled notification: ${JSON.stringify(notification)}\n`)
+}
+
 // Handle permission requests from Claude — forward to daemon which sends to Matrix
 mcp.setNotificationHandler(
   z.object({
@@ -240,11 +248,12 @@ mcp.setNotificationHandler(
       tool_name: z.string(),
       description: z.string(),
       input_preview: z.string(),
-    }),
+    }).passthrough(),
   }),
   async ({ params }) => {
+    process.stderr.write(`[matrix:mcp] permission_request received: ${JSON.stringify(params)}\n`)
     try {
-      await sendRequest('permission_request', params)
+      await sendRequest('permission_request', params as Record<string, unknown>)
     } catch (err) {
       process.stderr.write(`[matrix:mcp] permission_request forward failed: ${err}\n`)
     }

@@ -12,7 +12,7 @@ import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, unlinkSync, existsSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join, extname, sep, basename } from 'path'
 import {
   MatrixClient,
@@ -45,7 +45,7 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const CRYPTO_DIR = join(STATE_DIR, 'crypto')
 const SYNC_FILE = join(STATE_DIR, 'bot-sync.json')
-const INBOX_DIR = join(STATE_DIR, 'inbox')
+const INBOX_DIR = join(tmpdir(), 'claude-matrix-inbox')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(CRYPTO_DIR, { recursive: true, mode: 0o700 })
@@ -356,8 +356,7 @@ function assertSendable(f: string): void {
     real = realpathSync(f)
     stateReal = realpathSync(STATE_DIR)
   } catch { return }
-  const inbox = join(stateReal, 'inbox')
-  if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
+  if (real.startsWith(stateReal + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
   }
 }
