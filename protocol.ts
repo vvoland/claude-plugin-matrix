@@ -26,13 +26,21 @@ export type DaemonResponse = {
 }
 
 // Push from daemon to all connected MCPs (incoming Matrix messages or cron triggers)
-export type DaemonPush = {
-  method: 'inbound'
-  params: {
-    content: string
-    meta: Record<string, string | undefined>
-  }
-}
+export type DaemonPush =
+  | {
+      method: 'inbound'
+      params: {
+        content: string
+        meta: Record<string, string | undefined>
+      }
+    }
+  | {
+      method: 'permission_response'
+      params: {
+        request_id: string
+        behavior: 'allow' | 'deny'
+      }
+    }
 
 // Cron task definition
 export type CronTask = {

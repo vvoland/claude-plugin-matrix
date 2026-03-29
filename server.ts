@@ -10,6 +10,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import * as net from 'net'
 import { spawn } from 'child_process'
 import { readFileSync, existsSync, openSync } from 'fs'
@@ -52,13 +53,21 @@ function processSocketLine(line: string): void {
         pending.resolve(resp.result)
       }
     }
-  } else if ('method' in msg && (msg as DaemonPush).method === 'inbound') {
+  } else if ('method' in msg) {
     const push = msg as DaemonPush
-    // Forward as MCP channel notification
-    void mcp.notification({
-      method: 'notifications/claude/channel',
-      params: push.params,
-    })
+    if (push.method === 'inbound') {
+      // Forward as MCP channel notification
+      void mcp.notification({
+        method: 'notifications/claude/channel',
+        params: push.params,
+      })
+    } else if (push.method === 'permission_response') {
+      // Forward permission decision back to Claude
+      void mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: push.params,
+      })
+    }
   }
 }
 
@@ -203,7 +212,7 @@ async function sendRequest(method: string, params: Record<string, unknown>): Pro
 const mcp = new Server(
   { name: 'matrix', version: '1.0.0' },
   {
-    capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
+    capabilities: { tools: {}, experimental: { 'claude/channel': {}, 'claude/channel/permission': {} } },
     instructions: [
       'The sender reads Matrix, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
@@ -219,6 +228,26 @@ const mcp = new Server(
       '',
       'This plugin includes a cron scheduler. Scheduled tasks fire as inbound messages with meta.source="cron". Use cron_create, cron_delete, cron_list, and cron_toggle to manage them. Schedule format is standard 5-field cron: minute hour dom month dow.',
     ].join('\n'),
+  },
+)
+
+// Handle permission requests from Claude — forward to daemon which sends to Matrix
+mcp.setNotificationHandler(
+  z.object({
+    method: z.literal('notifications/claude/channel/permission_request'),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
+    }),
+  }),
+  async ({ params }) => {
+    try {
+      await sendRequest('permission_request', params)
+    } catch (err) {
+      process.stderr.write(`[matrix:mcp] permission_request forward failed: ${err}\n`)
+    }
   },
 )
 

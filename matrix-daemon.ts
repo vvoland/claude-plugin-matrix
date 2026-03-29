@@ -536,6 +536,20 @@ AutojoinRoomsMixin.setupOnClient(client)
 
 let botUserId = ''
 
+// ---------- Permission request tracking ----------
+
+const pendingPermissions = new Map<string, {
+  tool_name: string
+  description: string
+  input_preview: string
+  eventIds: Map<string, string> // eventId → request_id (for reaction-based replies)
+}>()
+
+// Reverse lookup: event_id → request_id for reaction handling
+const permissionEventMap = new Map<string, string>()
+
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
 // ---------- Connected MCP clients ----------
 
 const connectedClients = new Set<net.Socket>()
@@ -579,6 +593,26 @@ async function handleInbound(event: MatrixEvent, roomId: string): Promise<void> 
       body: `${lead} — run in Claude Code:\n\n/matrix:access pair ${result.code}`,
     })
     return
+  }
+
+  // Intercept text-based permission replies (e.g. "y abcde" or "no abcde")
+  const permMatch = PERMISSION_REPLY_RE.exec(body)
+  if (permMatch) {
+    const request_id = permMatch[2]!.toLowerCase()
+    if (pendingPermissions.has(request_id)) {
+      const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny' as const
+      const perm = pendingPermissions.get(request_id)!
+      // Clean up event mappings
+      for (const evId of perm.eventIds.keys()) permissionEventMap.delete(evId)
+      pendingPermissions.delete(request_id)
+      broadcast({ method: 'permission_response', params: { request_id, behavior } })
+      // React with result emoji
+      const emoji = behavior === 'allow' ? '\u2705' : '\u274c'
+      void client.sendEvent(roomId, 'm.reaction', {
+        'm.relates_to': { rel_type: 'm.annotation', event_id: event.event_id, key: emoji },
+      }).catch(() => {})
+      return
+    }
   }
 
   // Typing indicator
@@ -852,6 +886,60 @@ async function handleToolRequest(method: string, params: Record<string, unknown>
       return `task "${task.name}" is now ${enabled ? 'enabled' : 'disabled'}`
     }
 
+    case 'permission_request': {
+      const { request_id, tool_name, description, input_preview } = params as {
+        request_id: string; tool_name: string; description: string; input_preview: string
+      }
+      if (!request_id || !tool_name) throw new Error('request_id and tool_name are required')
+
+      let prettyInput: string
+      try {
+        prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+      } catch {
+        prettyInput = input_preview
+      }
+
+      const text =
+        `\ud83d\udd10 Permission: ${tool_name}\n\n` +
+        `tool_name: ${tool_name}\n` +
+        `description: ${description}\n` +
+        `input_preview:\n${prettyInput}\n\n` +
+        `Reply "\u2705 Allow" or "\u274c Deny" as a reaction, or type "y ${request_id}" / "n ${request_id}"`
+
+      const perm = {
+        tool_name,
+        description,
+        input_preview,
+        eventIds: new Map<string, string>(),
+      }
+      pendingPermissions.set(request_id, perm)
+
+      // Send to DM rooms of allowlisted users
+      const access = loadAccess()
+      let sent = 0
+      for (const userId of access.allowFrom) {
+        // Find DM room for this user
+        for (const [roomId, dmUser] of dmRooms.entries()) {
+          if (dmUser === userId) {
+            try {
+              const eventId = await client.sendMessage(roomId, {
+                msgtype: 'm.text',
+                body: text,
+              })
+              perm.eventIds.set(eventId, request_id)
+              permissionEventMap.set(eventId, request_id)
+              sent++
+            } catch (err) {
+              log('warn', `permission_request send to ${userId} failed: ${err}`)
+            }
+            break
+          }
+        }
+      }
+
+      return `permission request sent to ${sent} user(s)`
+    }
+
     default:
       throw new Error(`unknown method: ${method}`)
   }
@@ -979,6 +1067,30 @@ function setupMatrixHandlers(c: MatrixClient): void {
 
     const emoji = relatesTo.key as string
     const targetEventId = relatesTo.event_id as string
+
+    // Check if this is a reaction to a permission request message
+    const permRequestId = permissionEventMap.get(targetEventId)
+    if (permRequestId && (emoji === '\u2705' || emoji === '\u274c')) {
+      const access = loadAccess()
+      if (access.allowFrom.includes(event.sender)) {
+        const behavior = emoji === '\u2705' ? 'allow' : 'deny' as const
+        const perm = pendingPermissions.get(permRequestId)
+        if (perm) {
+          for (const evId of perm.eventIds.keys()) permissionEventMap.delete(evId)
+          pendingPermissions.delete(permRequestId)
+          broadcast({ method: 'permission_response', params: { request_id: permRequestId, behavior } })
+          // Edit the permission message to show result
+          const label = behavior === 'allow' ? '\u2705 Allowed' : '\u274c Denied'
+          void client.sendEvent(roomId, 'm.room.message', {
+            msgtype: 'm.text',
+            body: `* ${label}`,
+            'm.new_content': { msgtype: 'm.text', body: label },
+            'm.relates_to': { rel_type: 'm.replace', event_id: targetEventId },
+          }).catch(() => {})
+        }
+        return
+      }
+    }
 
     // Forward reaction as inbound notification
     const text = `[reaction: ${emoji} on ${targetEventId}]`
