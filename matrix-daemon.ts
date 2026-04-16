@@ -548,6 +548,8 @@ const pendingPermissions = new Map<string, {
 const permissionEventMap = new Map<string, string>()
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+const PERMISSION_ALLOW_EMOJI = '👍'
+const PERMISSION_DENY_EMOJI = '👎'
 
 // ---------- Connected MCP clients ----------
 
@@ -606,7 +608,7 @@ async function handleInbound(event: MatrixEvent, roomId: string): Promise<void> 
       pendingPermissions.delete(request_id)
       broadcast({ method: 'permission_response', params: { request_id, behavior } })
       // React with result emoji
-      const emoji = behavior === 'allow' ? '\u2705' : '\u274c'
+      const emoji = behavior === 'allow' ? PERMISSION_ALLOW_EMOJI : PERMISSION_DENY_EMOJI
       void client.sendEvent(roomId, 'm.reaction', {
         'm.relates_to': { rel_type: 'm.annotation', event_id: event.event_id, key: emoji },
       }).catch(() => {})
@@ -903,7 +905,7 @@ async function handleToolRequest(method: string, params: Record<string, unknown>
         `tool_name: ${tool_name}\n` +
         `description: ${description}\n` +
         `input_preview:\n${prettyInput}\n\n` +
-        `Reply "\u2705 Allow" or "\u274c Deny" as a reaction, or type "y ${request_id}" / "n ${request_id}"`
+        `Reply "${PERMISSION_ALLOW_EMOJI} Allow" or "${PERMISSION_DENY_EMOJI} Deny" as a reaction, or type "y ${request_id}" / "n ${request_id}"`
 
       const perm = {
         tool_name,
@@ -1056,7 +1058,7 @@ function setupMatrixHandlers(c: MatrixClient): void {
     await handleInbound(event, roomId)
   })
 
-  // Handle reactions (👍 = approval/confirmation)
+  // Handle reactions (👍 = allow, 👎 = deny for permission requests)
   c.on('room.event', async (roomId: string, event: MatrixEvent) => {
     if (!event?.sender || event.sender === botUserId) return
     if (event.type !== 'm.reaction') return
@@ -1069,17 +1071,17 @@ function setupMatrixHandlers(c: MatrixClient): void {
 
     // Check if this is a reaction to a permission request message
     const permRequestId = permissionEventMap.get(targetEventId)
-    if (permRequestId && (emoji === '\u2705' || emoji === '\u274c')) {
+    if (permRequestId && (emoji === PERMISSION_ALLOW_EMOJI || emoji === PERMISSION_DENY_EMOJI)) {
       const access = loadAccess()
       if (access.allowFrom.includes(event.sender)) {
-        const behavior = emoji === '\u2705' ? 'allow' : 'deny' as const
+        const behavior = emoji === PERMISSION_ALLOW_EMOJI ? 'allow' : 'deny' as const
         const perm = pendingPermissions.get(permRequestId)
         if (perm) {
           for (const evId of perm.eventIds.keys()) permissionEventMap.delete(evId)
           pendingPermissions.delete(permRequestId)
           broadcast({ method: 'permission_response', params: { request_id: permRequestId, behavior } })
           // Edit the permission message to show result
-          const label = behavior === 'allow' ? '\u2705 Allowed' : '\u274c Denied'
+          const label = behavior === 'allow' ? `${PERMISSION_ALLOW_EMOJI} Allowed` : `${PERMISSION_DENY_EMOJI} Denied`
           void client.sendEvent(roomId, 'm.room.message', {
             msgtype: 'm.text',
             body: `* ${label}`,
